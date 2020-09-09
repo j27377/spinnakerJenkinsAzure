@@ -1,0 +1,355 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "adminUsername": {
+      "type": "String",
+      "metadata": {
+        "description": "User name for the Virtual Machine."
+      }
+    },
+    "sshPublicKey": {
+      "type": "String",
+      "metadata": {
+        "description": "Configure all linux machines with the SSH public key string.  Your key should include three parts, for example 'ssh-rsa AAAAB...snip...UcyupgH azureuser@linuxvm'"
+      }
+    },
+    "devopsDnsPrefix": {
+      "type": "String",
+      "metadata": {
+        "description": "Unique DNS Name for the Public IP used to access the combined Jenkins and Spinnaker Virtual Machine."
+      }
+    },
+    "servicePrincipalAppId": {
+      "type": "String",
+      "metadata": {
+        "description": "Service Principal App ID (also called Client ID) that has contributor rights to the subscription used for this deployment. It is used by the Kubernetes cluster to dynamically manage resources (e.g. user-defined load balancers)."
+      }
+    },
+    "servicePrincipalAppKey": {
+      "type": "SecureString",
+      "metadata": {
+        "description": "Service Principal App Key (also called Client Secret) that has contributor rights to the subscription used for this deployment. It is used by the Kubernetes cluster to dynamically manage resources (e.g. user-defined load balancers)."
+      }
+    },
+    "gitRepository": {
+      "defaultValue": "https://github.com/azure-devops/spin-kub-demo.git",
+      "type": "String",
+      "metadata": {
+        "description": "The URL to a public git repository used for the default Jenkins job. It must include a Dockerfile at the root of the repo."
+      }
+    },
+    "dockerRepository": {
+      "defaultValue": "azure-devops/spin-kub-demo",
+      "type": "String",
+      "metadata": {
+        "description": "The repository name used by the default Jenkins job and Spinnaker pipeline. This repository will be created in your Azure Container Registry."
+      }
+    },
+    "location": {
+      "defaultValue": "[resourceGroup().location]",
+      "type": "String",
+      "metadata": {
+        "description": "Location for all resources."
+      }
+    },
+    "virtualNetworks_vnet_ejDev_dev_cus_dev_externalid": {
+      "defaultValue": "/subscriptions/cb60bee9-bb7f-421e-9bab-ff00b11cc1be/resourceGroups/rg-ejDev-dev-cus-devnetwork/providers/Microsoft.Network/virtualNetworks/vnet-ejDev-dev-cus-dev",
+      "type": "String"
+    }
+  },
+  "variables": {
+    "resourcePrefix": "devopaul",
+    "storageAccountName": "[concat(variables('resourcePrefix'), uniquestring(resourceGroup().id))]",
+    "acrStorageAccountName": "[concat('registry', uniqueString(resourceGroup().id))]",
+    "acrName": "[uniqueString(resourceGroup().id)]",
+    "nicName": "[concat(variables('resourcePrefix'), 'VMNic')]",
+    "subnetName": "[concat(variables('resourcePrefix'), 'Subnet')]",
+    "publicIPAddressName": "[concat(variables('resourcePrefix'), 'PublicIPDev')]",
+    "vmName": "[concat(variables('resourcePrefix'), 'VMDev')]",
+    "virtualNetworkName": "[concat(variables('resourcePrefix'), 'VNET')]",
+    "vmExtensionName": "[concat(variables('resourcePrefix'), 'Init')]",
+    "frontEndNSGName": "[concat(variables('resourcePrefix'), 'NSG')]",
+    "kubernetesName": "[concat('containerservice-', resourceGroup().name)]",
+    "kubernetesDnsPrefix": "[concat('k8s', variables('resourcePrefix'))]",
+    "pipelinePort": "8000",
+    "_artifactsLocation": "https://raw.githubusercontent.com/j27377/azure-quickstart-templates/master/301-jenkins-acr-spinnaker-k8s/",
+    "_extensionScript": "301-jenkins-acr-spinnaker-k8s.sh",
+    "_artifactsLocationSasToken": ""
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2016-01-01",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "Storage",
+      "properties": {}
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2016-01-01",
+      "name": "[variables('acrStorageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": {
+        "name": "Standard_LRS"
+      },
+      "kind": "Storage",
+      "properties": {
+        "encryption": {
+          "services": {
+            "blob": {
+              "enabled": true
+            }
+          },
+          "keySource": "Microsoft.Storage"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.ContainerRegistry/registries",
+      "apiVersion": "2019-12-01-preview",
+      "name": "[variables('acrName')]",
+      "location": "centralus",
+      "tags": {
+        "deployment": "spinnaker"
+      },
+      "sku": {
+        "name": "Basic",
+        "tier": "Basic"
+      },
+      "properties": {
+        "adminUserEnabled": false,
+        "policies": {
+          "quarantinePolicy": {
+            "status": "disabled"
+          },
+          "trustPolicy": {
+            "type": "Notary",
+            "status": "disabled"
+          },
+          "retentionPolicy": {
+            "days": 7,
+            "status": "disabled"
+          }
+        },
+        "encryption": {
+          "status": "disabled"
+        },
+        "dataEndpointEnabled": false,
+        "publicNetworkAccess": "Enabled"
+      }
+    },
+    {
+      "type": "Microsoft.Network/publicIPAddresses",
+      "apiVersion": "2016-09-01",
+      "name": "[variables('publicIPAddressName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "publicIPAllocationMethod": "Dynamic",
+        "dnsSettings": {
+          "domainNameLabel": "[parameters('devopsDnsPrefix')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkSecurityGroups",
+      "apiVersion": "2015-06-15",
+      "name": "[variables('frontEndNSGName')]",
+      "location": "[parameters('location')]",
+      "tags": {
+        "displayName": "NSG - Front End"
+      },
+      "properties": {
+        "securityRules": [
+          {
+            "name": "ssh-rule",
+            "properties": {
+              "description": "Allow SSH",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "22",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 100,
+              "direction": "Inbound"
+            }
+          },
+          {
+            "name": "http-rule",
+            "properties": {
+              "description": "Allow HTTP",
+              "protocol": "Tcp",
+              "sourcePortRange": "*",
+              "destinationPortRange": "80",
+              "sourceAddressPrefix": "Internet",
+              "destinationAddressPrefix": "*",
+              "access": "Allow",
+              "priority": 101,
+              "direction": "Inbound"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2016-09-01",
+      "name": "[variables('virtualNetworkName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[concat('Microsoft.Network/networkSecurityGroups/', variables('frontEndNSGName'))]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.0.0.0/16"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "[variables('subnetName')]",
+            "properties": {
+              "addressPrefix": "10.0.0.0/24",
+              "networkSecurityGroup": {
+                "id": "[resourceId('Microsoft.Network/networkSecurityGroups', variables('frontEndNSGName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/networkInterfaces",
+      "apiVersion": "2016-09-01",
+      "name": "[variables('nicName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIPAddressName'))]",
+        "[resourceId('Microsoft.Network/virtualNetworks', variables('virtualNetworkName'))]"
+      ],
+      "properties": {
+        "ipConfigurations": [
+          {
+            "name": "ipconfig1",
+            "properties": {
+              "privateIPAllocationMethod": "Dynamic",
+              "publicIPAddress": {
+                "id": "[resourceId('Microsoft.Network/publicIPAddresses', variables('publicIPAddressName'))]"
+              },
+              "subnet": {
+                "id": "[concat(resourceId('Microsoft.Network/virtualNetworks', variables('virtualNetworkName')),'/subnets/',variables('subnetName'))]"
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Compute/virtualMachines",
+      "apiVersion": "2017-03-30",
+      "name": "[variables('vmName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+      ],
+      "properties": {
+        "hardwareProfile": {
+          "vmSize": "Standard_D1_v2"
+        },
+        "osProfile": {
+          "computerName": "[variables('vmName')]",
+          "adminUsername": "[parameters('adminUsername')]",
+          "linuxConfiguration": {
+            "disablePasswordAuthentication": true,
+            "ssh": {
+              "publicKeys": [
+                {
+                  "path": "[concat('/home/', parameters('adminUsername'), '/.ssh/authorized_keys')]",
+                  "keyData": "[parameters('sshPublicKey')]"
+                }
+              ]
+            }
+          }
+        },
+        "storageProfile": {
+          "imageReference": {
+            "publisher": "Canonical",
+            "offer": "UbuntuServer",
+            "sku": "14.04.5-LTS",
+            "version": "latest"
+          },
+          "osDisk": {
+            "name": "[concat(variables('vmName'),'_OSDisk')]",
+            "caching": "ReadWrite",
+            "createOption": "FromImage",
+            "managedDisk": {
+              "storageAccountType": "Standard_LRS"
+            }
+          }
+        },
+        "networkProfile": {
+          "networkInterfaces": [
+            {
+              "id": "[resourceId('Microsoft.Network/networkInterfaces', variables('nicName'))]"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "outputs": {
+    "devopsVmFQDN": {
+      "type": "String",
+      "value": "[reference(variables('publicIPAddressName')).dnsSettings.fqdn]"
+    },
+    "jenkinsURL": {
+      "type": "String",
+      "value": "[concat('http://', reference(variables('publicIPAddressName')).dnsSettings.fqdn)]"
+    },
+    "SSH": {
+      "type": "String",
+      "value": "[concat('ssh -L 8080:localhost:8080 -L 9000:localhost:9000 -L 8084:localhost:8084 -L 8001:localhost:8001 ', parameters('adminUsername'), '@', reference(variables('publicIPAddressName')).dnsSettings.fqdn)]"
+    },
+    "storageAccountName": {
+      "type": "String",
+      "value": "[variables('storageAccountName')]"
+    },
+    "artifactsLocation": {
+      "type": "String",
+      "value": "[variables('_artifactsLocation')]"
+    },
+    "artifactsLocationSasToken": {
+      "type": "String",
+      "value": "[variables('_artifactsLocationSasToken')]"
+    },
+    "valueForsak": {
+      "type": "String",
+      "value": "[concat(listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2019-04-01').keys[0].value)]"
+    },
+    "subscriptionId": {
+      "type": "String",
+      "value": "[subscription().subscriptionId]"
+    },
+    "tenantId": {
+      "type": "String",
+      "value": "[subscription().tenantId]"
+    },
+    "resourceGroupName": {
+      "type": "String",
+      "value": "[resourceGroup().name]"
+    },
+    "valueForsak": {
+      "type": "String",
+      "value": "[concat(listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2019-04-01').keys[0].value)]"
+    },
+    "azureContainerRegistryUrl": {
+      "type": "String",
+      "value": "[reference(resourceId('Microsoft.ContainerRegistry/registries', variables('acrName'))).loginServer]"
+    }
+  }
+}
