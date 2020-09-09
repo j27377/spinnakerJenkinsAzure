@@ -1,0 +1,2 @@
+# spinnakerJenkinsAzure
+demo from template
